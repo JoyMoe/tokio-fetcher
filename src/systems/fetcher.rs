@@ -1,17 +1,17 @@
 use crate::{Error, FetchEvent, Fetcher, Source};
 
-use async_std::fs;
-use futures::prelude::*;
+use futures::{Future, Stream, StreamExt};
+use hyper::client::connect::Connect;
 use std::{path::Path, sync::Arc};
-use surf::middleware::HttpClient;
+use tokio::fs;
 
 #[derive(new, Setters)]
-pub struct FetcherSystem<C: HttpClient> {
+pub struct FetcherSystem<C> {
     #[setters(skip)]
     client: Arc<Fetcher<C>>,
 }
 
-impl<C: HttpClient> FetcherSystem<C> {
+impl<C: Connect + Clone + Send + Sync + 'static> FetcherSystem<C> {
     pub fn build<I, T>(
         self,
         inputs: I,

@@ -2,10 +2,6 @@
 
 > This project is currently in an alpha state as the API is being figured out, and features implemented.
 
-## Example
-
-See the official [fetcher utility](./fetcher) for a demonstration of the API.
-
 ## License
 
 Licensed under either of

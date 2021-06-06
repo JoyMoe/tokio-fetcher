@@ -1,10 +1,10 @@
 use digest::{generic_array::GenericArray, Digest};
-use futures::prelude::*;
 use hex::FromHex;
 use md5::Md5;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::{convert::TryFrom, io};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Debug)]
 pub enum Checksum {
@@ -80,7 +80,7 @@ async fn checksum<D: Digest, F: AsyncRead + Unpin>(
         read = reader.read(buffer).await.map_err(ChecksumError::IO)?;
 
         if read == 0 {
-            let result = hasher.result();
+            let result = hasher.finalize();
             return if result == *expected {
                 Ok(())
             } else {
@@ -90,6 +90,6 @@ async fn checksum<D: Digest, F: AsyncRead + Unpin>(
             };
         }
 
-        hasher.input(&buffer[..read]);
+        hasher.update(&buffer[..read]);
     }
 }

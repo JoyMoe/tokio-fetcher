@@ -1,11 +1,11 @@
 use crate::Error;
 
-use async_std::{
+use futures::{Stream, StreamExt};
+use std::{path::Path, sync::Arc};
+use tokio::{
     fs::{self, File},
     io::copy,
-    prelude::*,
 };
-use std::{path::Path, sync::Arc};
 
 pub async fn concatenator<P>(dest: &mut File, mut parts: P) -> Result<(), Error>
 where

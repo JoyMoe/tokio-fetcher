@@ -15,6 +15,19 @@ mod systems;
 
 pub use self::systems::*;
 
+use chrono::{DateTime, Utc};
+use filetime::FileTime;
+use futures::{
+    channel::mpsc,
+    stream::{self, StreamExt},
+};
+use hyper::{
+    body::{Body, HttpBody},
+    client::{connect::Connect, Client},
+    header::{HeaderMap, HeaderValue},
+    Method, Request, Response, StatusCode,
+};
+use numtoa::NumToA;
 use std::{
     fmt::Debug,
     io,
@@ -24,25 +37,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
-
-use async_std::{
+use tokio::{
     fs::{self, File},
-    prelude::*,
-};
-
-use chrono::{DateTime, Utc};
-use filetime::FileTime;
-use futures::{
-    channel::mpsc,
-    stream::{self, StreamExt},
-};
-use http::StatusCode;
-use http_client::native::NativeClient;
-use numtoa::NumToA;
-use surf::{
-    headers::Headers, middleware::HttpClient, Client, Exception, Request, Response,
+    io::AsyncWriteExt,
 };
 
 pub type EventSender = mpsc::UnboundedSender<(Arc<Path>, FetchEvent)>;
@@ -54,7 +53,7 @@ pub enum Error {
     #[error("task was cancelled")]
     Cancelled,
     #[error("http client error")]
-    Client(#[from] Exception),
+    Client(#[from] hyper::Error),
     #[error("unable to concatenate fetched parts")]
     Concatenate(#[source] io::Error),
     #[error("unable to create file")]
@@ -130,9 +129,9 @@ pub enum FetchEvent {
 /// application. A single-threaded runtime is generally recommended for fetching files,
 /// as your network connection is unlikely to be faster than a single CPU core.
 #[derive(new, Setters)]
-pub struct Fetcher<C: HttpClient> {
+pub struct Fetcher<C> {
     #[setters(skip)]
-    client: Client<C>,
+    client: Client<C, Body>,
 
     /// When set, cancels any active operations.
     #[new(default)]
@@ -151,11 +150,6 @@ pub struct Fetcher<C: HttpClient> {
     #[new(value = "unsafe { NonZeroU32::new_unchecked(2 * 1024 * 1024) }")]
     max_part_size: NonZeroU32,
 
-    /// The time to wait between chunks before giving up.
-    #[new(default)]
-    #[setters(strip_option)]
-    timeout: Option<Duration>,
-
     /// Holds a sender for submitting events to.
     #[new(default)]
     #[setters(into)]
@@ -163,13 +157,11 @@ pub struct Fetcher<C: HttpClient> {
     events: Option<Arc<EventSender>>,
 }
 
-impl Default for Fetcher<NativeClient> {
-    fn default() -> Self { Self::new(Client::new()) }
-}
-
-impl<C: HttpClient> Fetcher<C> {
+impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
     /// Wraps the fetcher in an Arc.
-    pub fn into_arc(self) -> Arc<Self> { Arc::new(self) }
+    pub fn into_arc(self) -> Arc<Self> {
+        Arc::new(self)
+    }
 
     /// Request a file from one or more URIs.
     ///
@@ -206,7 +198,7 @@ impl<C: HttpClient> Fetcher<C> {
 
         // If the file already exists, validate that it is the same.
         if to.exists() {
-            if let Some(mut response) = head(&self.client, &*uris[0]).await? {
+            if let Some(response) = self.head(&*uris[0]).await? {
                 let headers = &(response.headers());
                 let content_length = content_length(headers);
                 modified = last_modified(headers);
@@ -245,7 +237,7 @@ impl<C: HttpClient> Fetcher<C> {
 
         // If set, this will use multiple connections to download a file in parts.
         if let Some(connections) = self.connections_per_file {
-            if let Some(mut response) = head(&self.client, &*uris[0]).await? {
+            if let Some(response) = self.head(&*uris[0]).await? {
                 let headers = &(response.headers());
                 modified = last_modified(headers);
                 let length = match length {
@@ -254,7 +246,7 @@ impl<C: HttpClient> Fetcher<C> {
                 };
 
                 if let Some(length) = length {
-                    if supports_range(&self.client, &*uris[0], length).await? {
+                    if self.supports_range(&*uris[0], length).await? {
                         self.send((to.clone(), FetchEvent::ContentLength(length)));
 
                         return self
@@ -265,17 +257,29 @@ impl<C: HttpClient> Fetcher<C> {
             }
         }
 
-        let mut request = self.client.get(&*uris[0]).set_header("Expect", "");
+        let mut request = Request::builder()
+            .method(Method::GET) //
+            .uri(&*uris[0]) //
+            .header("Expect", "");
+
         if let Some(modified_since) = if_modified_since {
-            request = request.set_header("if-modified-since", modified_since.as_str());
+            request = request.header("if-modified-since", modified_since);
         }
+
+        let request = request.body(Body::empty()).unwrap();
 
         let path =
             match self.get(&mut modified, request, to.clone(), to.clone(), None).await {
                 Ok(path) => path,
                 // Server does not support if-modified-since
                 Err(Error::Status(StatusCode::NOT_IMPLEMENTED)) => {
-                    let request = self.client.get(&*uris[0]).set_header("Expect", "");
+                    let request = Request::builder()
+                        .method(Method::GET) //
+                        .uri(&*uris[0]) //
+                        .header("Expect", "") //
+                        .body(Body::empty())
+                        .unwrap();
+
                     self.get(&mut modified, request, to.clone(), to, None).await?
                 }
                 Err(why) => return Err(why),
@@ -293,7 +297,7 @@ impl<C: HttpClient> Fetcher<C> {
     async fn get(
         &self,
         modified: &mut Option<DateTime<Utc>>,
-        request: Request<C>,
+        request: Request<Body>,
         to: Arc<Path>,
         dest: Arc<Path>,
         length: Option<u64>,
@@ -304,11 +308,7 @@ impl<C: HttpClient> Fetcher<C> {
             file.set_len(length).await.map_err(Error::Write)?;
         }
 
-        let response = &mut validate(if let Some(duration) = self.timeout {
-            timed(duration, async { request.await.map_err(Error::from) }).await??
-        } else {
-            request.await?
-        })?;
+        let response = &mut validate(self.client.request(request).await?)?;
 
         if modified.is_none() {
             *modified = last_modified(&(response.headers()));
@@ -318,28 +318,16 @@ impl<C: HttpClient> Fetcher<C> {
             return Ok(to);
         }
 
-        let buffer = &mut [0u8; 8 * 1024];
-        let mut read;
-
-        loop {
+        while let Some(chunk) = response.body_mut().data().await {
             if self.cancelled() {
                 return Err(Error::Cancelled);
             }
 
-            let reader = async { response.read(buffer).await.map_err(Error::Write) };
+            let chunk = chunk?;
 
-            read = match self.timeout {
-                Some(duration) => timed(duration, reader).await??,
-                None => reader.await?,
-            };
+            self.send((dest.clone(), FetchEvent::Progress(chunk.len())));
 
-            if read != 0 {
-                self.send((dest.clone(), FetchEvent::Progress(read)));
-
-                file.write_all(&buffer[..read]).await.map_err(Error::Write)?;
-            } else {
-                break;
-            }
+            file.write_all(&chunk).await.map_err(Error::Write)?;
         }
 
         Ok(to)
@@ -386,11 +374,13 @@ impl<C: HttpClient> Fetcher<C> {
 
                     fetcher.send((to.clone(), FetchEvent::PartFetching(partn as u64)));
 
-                    let request = fetcher
-                        .client
-                        .get(&*uri)
-                        .set_header("range", range.as_str())
-                        .set_header("Expect", "");
+                    let request = Request::builder()
+                        .method(Method::GET) //
+                        .uri(&*uri) //
+                        .header("range", range) //
+                        .header("Expect", "") //
+                        .body(Body::empty())
+                        .unwrap();
 
                     let result = fetcher
                         .get(
@@ -424,6 +414,39 @@ impl<C: HttpClient> Fetcher<C> {
         Ok(())
     }
 
+    async fn head(&self, uri: &str) -> Result<Option<Response<Body>>, Error> {
+        let request = Request::builder()
+            .method(Method::HEAD) //
+            .uri(uri) //
+            .header("Expect", "") //
+            .body(Body::empty())
+            .unwrap();
+
+        match validate(self.client.request(request).await?).map(Some) {
+            result @ Ok(_) => result,
+            Err(Error::Status(StatusCode::NOT_IMPLEMENTED)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
+    async fn supports_range(&self, uri: &str, length: u64) -> Result<bool, Error> {
+        let request = Request::builder()
+            .method(Method::HEAD) //
+            .uri(uri) //
+            .header("Expect", "") //
+            .header("range", range::to_string(0, length)) //
+            .body(Body::empty())
+            .unwrap();
+
+        let response = self.client.request(request).await?;
+
+        if response.status() == StatusCode::PARTIAL_CONTENT {
+            Ok(true)
+        } else {
+            validate(response).map(|_| false)
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.cancel.as_ref().map_or(false, |cancel| cancel.load(Ordering::SeqCst))
     }
@@ -435,54 +458,22 @@ impl<C: HttpClient> Fetcher<C> {
     }
 }
 
-fn content_length(headers: &Headers) -> Option<u64> {
-    headers.get("content-length").and_then(|header| header.parse::<u64>().ok())
+fn content_length(headers: &HeaderMap<HeaderValue>) -> Option<u64> {
+    headers
+        .get("content-length")
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.parse::<u64>().ok())
 }
 
-fn last_modified(headers: &Headers) -> Option<DateTime<Utc>> {
+fn last_modified(headers: &HeaderMap<HeaderValue>) -> Option<DateTime<Utc>> {
     headers
         .get("last-modified")
+        .and_then(|header| header.to_str().ok())
         .and_then(|header| DateTime::parse_from_rfc2822(header).ok())
         .map(|tz| tz.with_timezone(&Utc))
 }
 
-async fn head<C: HttpClient>(
-    client: &Client<C>,
-    uri: &str,
-) -> Result<Option<Response>, Error> {
-    match validate(client.head(uri).set_header("Expect", "").await?).map(Some) {
-        result @ Ok(_) => result,
-        Err(Error::Status(StatusCode::NOT_IMPLEMENTED)) => Ok(None),
-        Err(other) => Err(other),
-    }
-}
-
-async fn supports_range<C: HttpClient>(
-    client: &Client<C>,
-    uri: &str,
-    length: u64,
-) -> Result<bool, Error> {
-    let response = client
-        .head(uri)
-        .set_header("Expect", "")
-        .set_header("range", range::to_string(0, length).as_str())
-        .await?;
-
-    if response.status() == StatusCode::PARTIAL_CONTENT {
-        Ok(true)
-    } else {
-        validate(response).map(|_| false)
-    }
-}
-
-async fn timed<F, T>(duration: Duration, future: F) -> Result<T, Error>
-where
-    F: Future<Output = T>,
-{
-    async_std::future::timeout(duration, future).await.map_err(|_| Error::TimedOut)
-}
-
-fn validate(response: Response) -> Result<Response, Error> {
+fn validate(response: Response<Body>) -> Result<Response<Body>, Error> {
     let status = response.status();
 
     if status.as_u16() < 300 {

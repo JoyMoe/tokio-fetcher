@@ -1,8 +1,9 @@
 use crate::checksum::{Checksum, ChecksumError};
-use async_std::fs::{self, File};
-use futures::prelude::*;
+
+use futures::{Future, Stream, StreamExt};
 use remem::Pool;
 use std::{io, path::Path, sync::Arc};
+use tokio::fs::{self, File};
 
 #[derive(Debug, Error)]
 pub enum ChecksummerError {

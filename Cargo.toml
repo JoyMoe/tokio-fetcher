@@ -1,7 +1,7 @@
 [package]
-name = "async-fetcher"
+name = "tokio-fetcher"
 version = "0.3.0-alpha.2"
-repository = "https://github.com/pop-os/async-fetcher"
+repository = "https://github.com/JoyMoe/tokio-fetcher"
 authors = ["Michael Aaron Murphy <mmstickman@gmail.com>"]
 description = "Asynchronous file fetcher, with optional fetching based on modified times and checksums"
 keywords = ["async", "file", "fetcher", "download", "parallel"]
@@ -10,27 +10,21 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 edition = "2018"
 
-[workspace]
-members = [ "fetcher" ]
-
 [dependencies]
-async-std = "1"
-async-stream = "0.2"
 chrono = "0.4"
 derive_more = "0.99"
 derive_setters = "0.1"
 derive-new = "0.5"
-digest = "0.8"
+digest = "0.9"
 filetime = "0.2"
 futures = "0.3"
 hex = "0.4"
-http = "0.1"
-http-client =  { version = "1", features = [ "native_client" ] }
+hyper = { version = "0.14", features = [ "client", "http1", "http2" ] }
 log = "0.4"
-md-5 = "0.8"
+md-5 = "0.9"
 numtoa = "0.2"
 remem = "0.1"
 serde = { version = "1", features = [ "derive" ] }
-sha2 = "0.8"
-surf = { version = " = 2.0.0-alpha.0" }
+sha2 = "0.9"
 thiserror = "1"
+tokio = { version = "1", features = [ "fs", "io-util" ] }
