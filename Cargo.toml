@@ -1,6 +1,6 @@
 [package]
 name = "tokio-fetcher"
-version = "0.3.0-alpha.2"
+version = "0.4.0"
 repository = "https://github.com/JoyMoe/tokio-fetcher"
 authors = ["Michael Aaron Murphy <mmstickman@gmail.com>"]
 description = "Asynchronous file fetcher, with optional fetching based on modified times and checksums"
@@ -27,4 +27,4 @@ remem = "0.1"
 serde = { version = "1", features = [ "derive" ] }
 sha2 = "0.9"
 thiserror = "1"
-tokio = { version = "1", features = [ "fs", "io-util" ] }
+tokio = { version = "1", features = [ "fs", "io-util", "time" ] }

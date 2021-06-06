@@ -37,7 +37,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
     fs::{self, File},
@@ -146,6 +146,12 @@ pub struct Fetcher<C> {
     #[new(value = "unsafe { NonZeroU16::new_unchecked(3) } ")]
     retries: NonZeroU16,
 
+    /// Delay before retries.
+    #[new(default)]
+    #[setters(into)]
+    #[setters(strip_option)]
+    delay: Option<Duration>,
+
     /// The maximum size of a part file when downloading in parts.
     #[new(value = "unsafe { NonZeroU32::new_unchecked(2 * 1024 * 1024) }")]
     max_part_size: NonZeroU32,
@@ -176,6 +182,10 @@ impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
             Ok(()) => Ok(()),
             Err(mut why) => {
                 for _ in 1..self.retries.get() {
+                    if let Some(delay) = self.delay {
+                        tokio::time::sleep(delay).await;
+                    }
+
                     match self.clone().inner_request(uris.clone(), to.clone()).await {
                         Ok(()) => return Ok(()),
                         Err(cause) => why = cause,
@@ -260,7 +270,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
         let mut request = Request::builder()
             .method(Method::GET) //
             .uri(&*uris[0]) //
-            .header("Expect", "");
+            .header("expect", "");
 
         if let Some(modified_since) = if_modified_since {
             request = request.header("if-modified-since", modified_since);
@@ -276,7 +286,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
                     let request = Request::builder()
                         .method(Method::GET) //
                         .uri(&*uris[0]) //
-                        .header("Expect", "") //
+                        .header("expect", "") //
                         .body(Body::empty())
                         .unwrap();
 
@@ -367,6 +377,8 @@ impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
                 };
 
                 let fetcher = self.clone();
+                let retries = self.retries.get();
+                let delay = self.delay;
                 let to = to_.clone();
 
                 async move {
@@ -374,23 +386,39 @@ impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
 
                     fetcher.send((to.clone(), FetchEvent::PartFetching(partn as u64)));
 
-                    let request = Request::builder()
-                        .method(Method::GET) //
-                        .uri(&*uri) //
-                        .header("range", range) //
-                        .header("Expect", "") //
-                        .body(Body::empty())
-                        .unwrap();
+                    let mut result: Result<Arc<Path>, Error> = Err(Error::Cancelled);
 
-                    let result = fetcher
-                        .get(
-                            &mut modified,
-                            request,
-                            part_path.into(),
-                            to.clone(),
-                            Some(range_end - range_start),
-                        )
-                        .await;
+                    for _ in 1..retries {
+                        let request = Request::builder()
+                            .method(Method::GET) //
+                            .uri(&*uri) //
+                            .header("expect", "") //
+                            .header("range", &range) //
+                            .body(Body::empty())
+                            .unwrap();
+
+                        match fetcher
+                            .get(
+                                &mut modified,
+                                request,
+                                part_path.clone().into(),
+                                to.clone(),
+                                Some(range_end - range_start),
+                            )
+                            .await
+                        {
+                            Ok(res) => {
+                                result = Ok(res);
+
+                                break;
+                            }
+                            Err(cause) => result = Err(cause),
+                        }
+
+                        if let Some(delay) = delay {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
 
                     fetcher.send((to, FetchEvent::PartFetched(partn as u64)));
 
@@ -418,7 +446,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
         let request = Request::builder()
             .method(Method::HEAD) //
             .uri(uri) //
-            .header("Expect", "") //
+            .header("expect", "") //
             .body(Body::empty())
             .unwrap();
 
@@ -430,10 +458,12 @@ impl<C: Connect + Clone + Send + Sync + 'static> Fetcher<C> {
     }
 
     async fn supports_range(&self, uri: &str, length: u64) -> Result<bool, Error> {
+        let length = if length > 1 { 1 } else { length };
+
         let request = Request::builder()
-            .method(Method::HEAD) //
+            .method(Method::GET) //
             .uri(uri) //
-            .header("Expect", "") //
+            .header("expect", "") //
             .header("range", range::to_string(0, length)) //
             .body(Body::empty())
             .unwrap();
